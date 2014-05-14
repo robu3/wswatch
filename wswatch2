@@ -1,0 +1,112 @@
+#!/usr/bin/env node
+
+// server for wswatch, serves the output of another program via WebSockets etc.
+
+"use strict";
+
+var argparse = require('argparse'),
+	express = require("express"),
+	bodyParser = require("body-parser"),
+	cookieParser = require("cookie-parser"),
+	session = require("express-session"),
+	socket = require('socket.io'),
+	child = require('child_process');
+
+var parser = new argparse.ArgumentParser({
+	version: '0.1.0',
+	description: "Unix watch(1) in the browser"
+});
+
+parser.addArgument([ '-p', '--port' ], { type: parseInt, required: true, help: "HTTP port to serve the view" });
+parser.addArgument([ '-n', '--interval' ], { defaultValue: 2, help: "Update interval in seconds (default: 2)" });
+parser.addArgument([ '-c', '--config' ], { help: "Optional config file for authentication settings." });
+parser.addArgument([ 'command' ], { help: "Program to run" });
+parser.addArgument([ 'args' ], { nargs: '...', help: "Arguments for program to run" });
+var args = parser.parseArgs();
+
+var config = args.config ? require("./" + args.config) : { secret: "none" },
+	isSecured = args.config !== null;
+
+var app = express();
+
+// include middleware
+app.use(bodyParser());
+app.use(cookieParser());
+app.use(session({ secret: config.secret }));
+
+var server = app.listen(args.port),
+	io = socket.listen(server);
+
+io.set('log level', 1); // reduce logging
+
+// setup command to run repeatedly
+var command = args.command;
+if (args.args) {
+    command += ' ' + args.args.join(' ');
+}
+
+var screen; // cache of last screen to speed up initial paint when new clients connect
+function run() {
+    // exec rather than spawn to handle shell syntax within command
+    child.exec(command, function (error, stdout, stderr) {
+		screen = stdout.toString();
+		io.sockets.emit('screen', screen);
+		if (stderr) {
+			console.error("error: " + stderr);
+		}
+		if (error !== null) {
+			console.error("exec error: " + error);
+		}
+	});
+}
+
+run(); // initial run to populate cache
+setInterval(run, args.interval * 1000);
+
+// setup websockets
+// TODO: include authorization here?
+io.sockets.on('connection', function (socket) {
+	socket.emit('title', command);
+	socket.emit('screen', screen); // initial paint from cache
+});
+
+// handle requests
+// auth
+app.post("/login", function (req, res) {
+	if (req.body.login === config.login && req.body.password == config.password) {
+		req.session.regenerate(function () {
+			req.session.user = req.body.login;
+
+			// take the user to the index page
+			res.redirect("/");
+		});	
+	} else {
+		res.end("Invalid credentials");
+	}
+});
+
+// logout
+app.get("/logout", function (req, res) {
+	req.session.destroy();
+	res.redirect("/");
+});
+
+// root page
+app.get("/", function (req, res) {
+	console.log("session", req.session);
+	console.log("isSecured", isSecured);
+
+	if (!isSecured || req.session.user) {
+		res.sendfile(__dirname + "/public/index.html");
+	} else {
+		// need to login
+		res.sendfile(__dirname + "/public/login.html");
+	}
+});
+
+// simplistic file router
+app.get("/:file", function (req, res) {
+	if (!isSecured || req.session.user) {
+		res.sendfile(__dirname + "/public/" + req.params.file);
+	}
+});
